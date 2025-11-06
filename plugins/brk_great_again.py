@@ -8,10 +8,9 @@ reference:
 - https://blog.ret2.io/2020/07/22/ida-pro-avx-decompiler/
 """
 
-import idaapi
-import ida_allins
-import ida_hexrays
-import ida_loader
+import idaapi  # pyright: ignore[reportMissingImports]
+import ida_allins  # pyright: ignore[reportMissingImports]
+import ida_hexrays  # pyright: ignore[reportMissingImports]
 
 """
 https://elixir.bootlin.com/linux/v6.17.7/source/arch/arm64/include/asm/brk-imm.h#L31
@@ -131,20 +130,25 @@ class CallBuilder:
         self.callinfo.solid_args += 1
 
     def add_register_address_argument(self, t, operand):
+        # Create pointer type first to get correct size
+        ptr_type = idaapi.tinfo_t(t)
+        ptr_type.create_ptr(ptr_type)
+
         addr_t = ida_hexrays.mop_addr_t()
         addr_t.t = idaapi.mop_r
         addr_t.r = operand
-        addr_t.type = t
-        addr_t.size = t.get_size()
-        addr_t.insize = t.get_size()
-        addr_t.outsize = t.get_size()
+        addr_t.type = t  # Keep original type for addr_t.type
+        # Use pointer size for address operations
+        ptr_size = ptr_type.get_size()
+        addr_t.size = ptr_size
+        addr_t.insize = ptr_size
+        addr_t.outsize = ptr_size
 
         ca = ida_hexrays.mcallarg_t()
         ca.t = idaapi.mop_a
         ca.a = addr_t
-        t.create_ptr(t)
-        ca.type = t
-        ca.size = t.get_size()
+        ca.type = ptr_type  # Use pointer type for call argument
+        ca.size = ptr_size
         self.callinfo.args.push_back(ca)
         self.callinfo.solid_args += 1
 
@@ -174,6 +178,20 @@ class CallBuilder:
         ins.d.size = 1
         self.cdg.mb.insert_into_block(ins, self.cdg.mb.tail)
 
+    def load_constant_to_temp_reg(self, value, size):
+        """
+        Allocate a temporary register and load a constant value into it.
+        Returns the register number.
+        """
+        temp_reg = self.cdg.mba.alloc_kreg(size)
+        ins = MicroInstruction(ida_hexrays.m_mov, self.cdg.insn.ea)
+        ins.d.t = idaapi.mop_r
+        ins.d.r = temp_reg
+        ins.d.size = size
+        ins.l.make_number(value, size)
+        self.cdg.mb.insert_into_block(ins, self.cdg.mb.tail)
+        return temp_reg
+
 
 class brk_stop_ins_t(idaapi.IDP_Hooks):
     def ev_emu_insn(self, insn):
@@ -182,11 +200,13 @@ class brk_stop_ins_t(idaapi.IDP_Hooks):
         return True
 
 
-class brk_better_microcode_t(ida_hexrays.microcode_filter_t):
+class better_arm64_microcode_t(ida_hexrays.microcode_filter_t):
     def __init__(self):
         super().__init__()
         self._handlers = {
             ida_allins.ARM_brk: self.brk,
+            ida_allins.ARM_hint: self.hint,
+            ida_allins.ARM_prfm: self.prfm,
         }
 
     def match(self, cdg):
@@ -209,6 +229,55 @@ class brk_better_microcode_t(ida_hexrays.microcode_filter_t):
         builder.emit()
         return ida_hexrays.MERR_OK
 
+    def hint(self, cdg, insn):
+        val = insn.Op1.value
+        if val == 0x14:
+            function_name = "__asm_csdb_barrier"
+            builder = CallBuilder(cdg, function_name)
+            builder.emit()
+            return ida_hexrays.MERR_OK
+        else:
+            return ida_hexrays.MERR_INSN
+
+    def prfm(self, cdg, insn):
+        # https://developer.arm.com/documentation/101458/2404/Optimize/Prefetching-with---builtin-prefetch
+        op1_val = insn.Op1.value
+        function_name = "__builtin_prefetch"
+        builder = CallBuilder(cdg, function_name)
+        arg1 = cdg.load_operand(1)
+        if op1_val == 0x01:  # PLDL1STRM
+            arg2 = builder.load_constant_to_temp_reg(0, 4)
+            arg3 = builder.load_constant_to_temp_reg(0, 4)
+        elif op1_val == 0x04:  # PLDL3KEEP
+            arg2 = builder.load_constant_to_temp_reg(0, 4)
+            arg3 = builder.load_constant_to_temp_reg(1, 4)
+        elif op1_val == 0x02:  # PLDL2KEEP
+            arg2 = builder.load_constant_to_temp_reg(0, 4)
+            arg3 = builder.load_constant_to_temp_reg(2, 4)
+        elif op1_val == 0x00:  # PLDL1KEEP
+            arg2 = builder.load_constant_to_temp_reg(0, 4)
+            arg3 = builder.load_constant_to_temp_reg(3, 4)
+        elif op1_val == 0x11:  # PSTL1STRM
+            arg2 = builder.load_constant_to_temp_reg(1, 4)
+            arg3 = builder.load_constant_to_temp_reg(0, 4)
+        elif op1_val == 0x14:  # PSTL3KEEP
+            arg2 = builder.load_constant_to_temp_reg(1, 4)
+            arg3 = builder.load_constant_to_temp_reg(1, 4)
+        elif op1_val == 0x12:  # PSTL2KEEP
+            arg2 = builder.load_constant_to_temp_reg(1, 4)
+            arg3 = builder.load_constant_to_temp_reg(2, 4)
+        elif op1_val == 0x10:  # PSTL1KEEP
+            arg2 = builder.load_constant_to_temp_reg(1, 4)
+            arg3 = builder.load_constant_to_temp_reg(3, 4)
+        else:
+            return ida_hexrays.MERR_INSN
+
+        builder.add_register_address_argument(idaapi.tinfo_t(idaapi.BT_VOID), arg1)
+        builder.add_register_argument(idaapi.tinfo_t(idaapi.BT_INT), arg2)
+        builder.add_register_argument(idaapi.tinfo_t(idaapi.BT_INT), arg3)
+        builder.emit()
+        return ida_hexrays.MERR_OK
+
     def hook(self):
         ida_hexrays.install_microcode_filter(self, True)
         print(
@@ -228,7 +297,8 @@ class BrkGreatAgainPlugin(idaapi.plugin_t):
     wanted_name = "BrkGreatAgainPlugin"
     wanted_hotkey = ""
     hook_of_brk_stop_ins_t = None
-    hook_ofbrk_better_microcode_t = None
+    hook_of_brk_better_microcode_t = None
+    hooks = []
 
     def init(self):
         # fast exit path
@@ -237,36 +307,31 @@ class BrkGreatAgainPlugin(idaapi.plugin_t):
             return idaapi.PLUGIN_SKIP
 
         if not self.hook_of_brk_stop_ins_t:
-            print("start brk_stop_ins_t !!!!!!!!")
+            print("[{}] start brk_stop_ins_t".format(self.wanted_name))
             self.hook_of_brk_stop_ins_t = brk_stop_ins_t()
             self.hook_of_brk_stop_ins_t.hook()
+            self.hooks.append(self.hook_of_brk_stop_ins_t)
 
         # ensure the decompiler is loaded
-        ida_loader.load_plugin("hexarm")  # load ARM decompiler
         if not ida_hexrays.init_hexrays_plugin():
             print("Missing hexarm Decompiler...")
-            return idaapi.PLUGIN_KEEP
+            return idaapi.PLUGIN_SKIP
 
-        if not self.hook_ofbrk_better_microcode_t:
-            print("start brk_better_microcode_t !!!!!!!!")
-            self.hook_ofbrk_better_microcode_t = brk_better_microcode_t()
-            self.hook_ofbrk_better_microcode_t.hook()
+        if not self.hook_of_brk_better_microcode_t:
+            print("[{}] start better_arm64_microcode_t".format(self.wanted_name))
+            self.hook_of_brk_better_microcode_t = better_arm64_microcode_t()
+            self.hook_of_brk_better_microcode_t.hook()
+            self.hooks.append(self.hook_of_brk_better_microcode_t)
 
-        print("%s is loaded!" % self.wanted_name)
         return idaapi.PLUGIN_KEEP
 
     def run(self, arg):
         pass
 
     def term(self):
-        if self.hook_of_brk_stop_ins_t:
-            self.hook_of_brk_stop_ins_t.unhook()
-            self.hook_of_brk_stop_ins_t = None
-        if self.hook_ofbrk_better_microcode_t:
-            self.hook_ofbrk_better_microcode_t.unhook()
-            self.hook_ofbrk_better_microcode_t = None
+        for hook in self.hooks:
+            hook.unhook()
 
 
 def PLUGIN_ENTRY():
     return BrkGreatAgainPlugin()
-
